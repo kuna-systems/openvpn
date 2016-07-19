@@ -60,8 +60,7 @@ socks_adjust_frame_parameters (struct frame *frame, int proto)
 struct socks_proxy_info *
 socks_proxy_new (const char *server,
 		 const char *port,
-		 const char *authfile,
-		 bool retry)
+		 const char *authfile)
 {
   struct socks_proxy_info *p;
 
@@ -78,7 +77,6 @@ socks_proxy_new (const char *server,
   else
     p->authfile[0] = 0;
 
-  p->retry = retry;
   p->defined = true;
 
   return p;
@@ -103,10 +101,13 @@ socks_username_password_auth (struct socks_proxy_info *p,
   ssize_t size;
 
   creds.defined = 0;
-  get_user_pass (&creds, p->authfile, UP_TYPE_SOCKS, GET_USER_PASS_MANAGEMENT);
+  if (!get_user_pass (&creds, p->authfile, UP_TYPE_SOCKS, GET_USER_PASS_MANAGEMENT))
+    {
+      msg (M_NONFATAL, "SOCKS failed to get username/password.");
+      return false;
+    }
 
-  if( !creds.username || (strlen(creds.username) > 255)
-      || !creds.password || (strlen(creds.password) > 255) ) {
+  if( (strlen(creds.username) > 255) || (strlen(creds.password) > 255) ) {
           msg (M_NONFATAL,
                "SOCKS username and/or password exceeds 255 characters.  "
                "Authentication not possible.");
@@ -131,7 +132,7 @@ socks_username_password_auth (struct socks_proxy_info *p,
       char c;
 
       FD_ZERO (&reads);
-      FD_SET (sd, &reads);
+      openvpn_fd_set (sd, &reads);
       tv.tv_sec = timeout_sec;
       tv.tv_usec = 0;
 
@@ -210,7 +211,7 @@ socks_handshake (struct socks_proxy_info *p,
       char c;
 
       FD_ZERO (&reads);
-      FD_SET (sd, &reads);
+      openvpn_fd_set (sd, &reads);
       tv.tv_sec = timeout_sec;
       tv.tv_usec = 0;
 
@@ -316,7 +317,7 @@ recv_socks_reply (socket_descriptor_t sd,
       char c;
 
       FD_ZERO (&reads);
-      FD_SET (sd, &reads);
+      openvpn_fd_set (sd, &reads);
       tv.tv_sec = timeout_sec;
       tv.tv_usec = 0;
 
@@ -467,9 +468,8 @@ establish_socks_proxy_passthru (struct socks_proxy_info *p,
   return;
 
  error:
-  /* on error, should we exit or restart? */
   if (!*signal_received)
-    *signal_received = (p->retry ? SIGUSR1 : SIGTERM); /* SOFT-SIGUSR1 -- socks error */
+    *signal_received = SIGUSR1; /* SOFT-SIGUSR1 -- socks error */
   return;
 }
 
@@ -505,9 +505,8 @@ establish_socks_proxy_udpassoc (struct socks_proxy_info *p,
   return;
 
  error:
-  /* on error, should we exit or restart? */
   if (!*signal_received)
-    *signal_received = (p->retry ? SIGUSR1 : SIGTERM); /* SOFT-SIGUSR1 -- socks error */
+    *signal_received = SIGUSR1; /* SOFT-SIGUSR1 -- socks error */
   return;
 }
 

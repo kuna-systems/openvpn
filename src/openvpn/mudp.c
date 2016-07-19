@@ -38,6 +38,10 @@
 
 #include "memdbg.h"
 
+#ifdef HAVE_SYS_INOTIFY_H
+#include <sys/inotify.h>
+#endif
+
 /*
  * Get a client instance based on real address.  If
  * the instance doesn't exist, create it while
@@ -75,7 +79,7 @@ multi_get_create_instance_udp (struct multi_context *m, bool *floated)
 	      {
 		/* reset prefix, since here we are not sure peer is the one it claims to be */
 		ungenerate_prefix(mi);
-		msg (D_MULTI_ERRORS, "Untrusted peer %" PRIu32 " wants to float to %s", peer_id,
+		msg (D_MULTI_MEDIUM, "Float requested for peer %" PRIu32 " to %s", peer_id,
 			mroute_addr_print (&real, &gc));
 	      }
 	    }
@@ -177,6 +181,10 @@ multi_process_io_udp (struct multi_context *m)
     strcat (buf, "TR/");
   else if (status & TUN_WRITE)
     strcat (buf, "TW/");
+#ifdef ENABLE_ASYNC_PUSH
+  else if (status & FILE_CLOSED)
+    strcat (buf, "FC/");
+#endif
   printf ("IO %s\n", buf);
 #endif
 
@@ -202,7 +210,6 @@ multi_process_io_udp (struct multi_context *m)
   else if (status & SOCKET_READ)
     {
       read_incoming_link (&m->top);
-      multi_release_io_lock (m);
       if (!IS_SIG (&m->top))
 	multi_process_incoming_link (m, NULL, mpp_flags);
     }
@@ -210,10 +217,16 @@ multi_process_io_udp (struct multi_context *m)
   else if (status & TUN_READ)
     {
       read_incoming_tun (&m->top);
-      multi_release_io_lock (m);
       if (!IS_SIG (&m->top))
 	multi_process_incoming_tun (m, mpp_flags);
     }
+#ifdef ENABLE_ASYNC_PUSH
+  /* INOTIFY callback */
+  else if (status & FILE_CLOSED)
+    {
+      multi_process_file_closed(m, mpp_flags);
+    }
+#endif
 }
 
 /*
@@ -268,13 +281,21 @@ tunnel_server_udp_single_threaded (struct context *top)
   multi_init (&multi, top, false, MC_SINGLE_THREADED);
 
   /* initialize our cloned top object */
-  multi_top_init (&multi, top, true);
+  multi_top_init (&multi, top);
 
   /* initialize management interface */
   init_management_callback_multi (&multi);
 
   /* finished with initialization */
   initialization_sequence_completed (top, ISC_SERVER); /* --mode server --proto udp */
+
+#ifdef ENABLE_ASYNC_PUSH
+  multi.top.c2.inotify_fd = inotify_init();
+  if (multi.top.c2.inotify_fd < 0)
+    {
+      msg (D_MULTI_ERRORS, "MULTI: inotify_init error: %s", strerror(errno));
+    }
+#endif
 
   /* per-packet event loop */
   while (true)
@@ -303,6 +324,10 @@ tunnel_server_udp_single_threaded (struct context *top)
       
       perf_pop ();
     }
+
+#ifdef ENABLE_ASYNC_PUSH
+  close(top->c2.inotify_fd);
+#endif
 
   /* shut down management interface */
   uninit_management_callback_multi (&multi);

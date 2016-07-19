@@ -208,12 +208,14 @@ check_connection_established_dowork (struct context *c)
 		  management_set_state (management,
 					OPENVPN_STATE_GET_CONFIG,
 					NULL,
-					0,
-					0);
+                                        NULL,
+                                        NULL,
+                                        NULL,
+                                        NULL);
 		}
 #endif
-	      /* send push request in 1 sec */
-	      event_timeout_init (&c->c2.push_request_interval, 1, now);
+	      /* fire up push request right away (already 1s delayed) */
+	      event_timeout_init (&c->c2.push_request_interval, 0, now);
 	      reset_coarse_timers (c);
 	    }
 	  else
@@ -322,6 +324,13 @@ check_inactivity_timeout_dowork (struct context *c)
   register_signal (c, SIGTERM, "inactive");
 }
 
+int
+get_server_poll_remaining_time (struct event_timeout* server_poll_timeout)
+{
+    update_time();
+    int remaining = event_timeout_remaining(server_poll_timeout);
+    return max_int (0, remaining);
+}
 #if P2MP
 
 void
@@ -430,6 +439,7 @@ encrypt_sign (struct context *c, bool comp_frag)
 {
   struct context_buffers *b = c->c2.buffers;
   const uint8_t *orig_buf = c->c2.buf.data;
+  struct crypto_options *co = NULL;
 
 #if P2MP_SERVER
   /*
@@ -454,39 +464,41 @@ encrypt_sign (struct context *c, bool comp_frag)
     }
 
 #ifdef ENABLE_CRYPTO
-  /*
-   * If TLS mode, get the key we will use to encrypt
-   * the packet.
-   */
+  /* initialize work buffer with FRAME_HEADROOM bytes of prepend capacity */
+  ASSERT (buf_init (&b->encrypt_buf, FRAME_HEADROOM (&c->c2.frame)));
+
   if (c->c2.tls_multi)
     {
-      tls_pre_encrypt (c->c2.tls_multi, &c->c2.buf, &c->c2.crypto_options);
+      /* Get the key we will use to encrypt the packet. */
+      tls_pre_encrypt (c->c2.tls_multi, &c->c2.buf, &co);
+      /* If using P_DATA_V2, prepend the 1-byte opcode and 3-byte peer-id to the
+       * packet before openvpn_encrypt(), so we can authenticate the opcode too.
+       */
+      if (c->c2.buf.len > 0 && !c->c2.tls_multi->opt.server && c->c2.tls_multi->use_peer_id)
+	tls_prepend_opcode_v2 (c->c2.tls_multi, &b->encrypt_buf);
+    }
+  else
+    {
+      co = &c->c2.crypto_options;
     }
 
-  /*
-   * Encrypt the packet and write an optional
-   * HMAC signature.
-   */
-  openvpn_encrypt (&c->c2.buf, b->encrypt_buf, &c->c2.crypto_options, &c->c2.frame);
+  /* Encrypt and authenticate the packet */
+  openvpn_encrypt (&c->c2.buf, b->encrypt_buf, co);
+
+  /* Do packet administration */
+  if (c->c2.tls_multi)
+    {
+      if (c->c2.buf.len > 0 && (c->c2.tls_multi->opt.server || !c->c2.tls_multi->use_peer_id))
+        tls_prepend_opcode_v1(c->c2.tls_multi, &c->c2.buf);
+      tls_post_encrypt (c->c2.tls_multi, &c->c2.buf);
+    }
 #endif
+
   /*
    * Get the address we will be sending the packet to.
    */
   link_socket_get_outgoing_addr (&c->c2.buf, get_link_socket_info (c),
 				 &c->c2.to_link_addr);
-#ifdef ENABLE_CRYPTO
-  /*
-   * In TLS mode, prepend the appropriate one-byte opcode
-   * to the packet which identifies it as a data channel
-   * packet and gives the low-permutation version of
-   * the key-id to the recipient so it knows which
-   * decrypt key to use.
-   */
-  if (c->c2.tls_multi)
-    {
-      tls_post_encrypt (c->c2.tls_multi, &c->c2.buf);
-    }
-#endif
 
   /* if null encryption, copy result to read_tun_buf */
   buffer_turnover (orig_buf, &c->c2.to_link, &c->c2.buf, &b->read_tun_buf);
@@ -533,13 +545,16 @@ process_coarse_timers (struct context *c)
     return;
 
 #if P2MP
-  check_server_poll_timeout (c);
-  if (c->sig->signal_received)
-    return;
+  if (c->c2.tls_multi)
+    {
+      check_server_poll_timeout (c);
+      if (c->sig->signal_received)
+	return;
 
-  check_scheduled_exit (c);
-  if (c->sig->signal_received)
-    return;
+      check_scheduled_exit (c);
+      if (c->sig->signal_received)
+	return;
+    }
 #endif
 
 #ifdef ENABLE_OCC
@@ -664,7 +679,6 @@ read_incoming_link (struct context *c)
 
   status = link_socket_read (c->c2.link_socket,
 			     &c->c2.buf,
-			     MAX_RW_SIZE_LINK (&c->c2.frame),
 			     &c->c2.from);
 
   if (socket_connection_reset (c->c2.link_socket, status))
@@ -772,6 +786,8 @@ process_incoming_link_part1 (struct context *c, struct link_socket_info *lsi, bo
    */
   if (c->c2.buf.len > 0)
     {
+      struct crypto_options *co = NULL;
+      const uint8_t *ad_start = NULL;
       if (!link_socket_verify_incoming_addr (&c->c2.buf, lsi, &c->c2.from))
 	link_socket_bad_incoming_addr (&c->c2.buf, lsi, &c->c2.from);
 
@@ -788,7 +804,8 @@ process_incoming_link_part1 (struct context *c, struct link_socket_info *lsi, bo
 	   * will load crypto_options with the correct encryption key
 	   * and return false.
 	   */
-	  if (tls_pre_decrypt (c->c2.tls_multi, &c->c2.from, &c->c2.buf, &c->c2.crypto_options, floated))
+	  if (tls_pre_decrypt (c->c2.tls_multi, &c->c2.from, &c->c2.buf, &co,
+	      floated, &ad_start))
 	    {
 	      interval_action (&c->c2.tmp_int);
 
@@ -796,6 +813,10 @@ process_incoming_link_part1 (struct context *c, struct link_socket_info *lsi, bo
 	      if (c->options.ping_rec_timeout)
 		event_timeout_reset (&c->c2.ping_rec_interval);
 	    }
+	}
+      else
+	{
+	  co = &c->c2.crypto_options;
 	}
 #if P2MP_SERVER
       /*
@@ -807,7 +828,8 @@ process_incoming_link_part1 (struct context *c, struct link_socket_info *lsi, bo
 #endif
 
       /* authenticate and decrypt the incoming packet */
-      decrypt_status = openvpn_decrypt (&c->c2.buf, c->c2.buffers->decrypt_buf, &c->c2.crypto_options, &c->c2.frame);
+      decrypt_status = openvpn_decrypt (&c->c2.buf, c->c2.buffers->decrypt_buf,
+	  co, &c->c2.frame, ad_start);
 
       if (!decrypt_status && link_socket_connection_oriented (c->c2.link_socket))
 	{
@@ -958,8 +980,9 @@ read_incoming_tun (struct context *c)
   /* Was TUN/TAP I/O operation aborted? */
   if (tuntap_abort(c->c2.buf.len))
   {
-     register_signal(c, SIGTERM, "tun-abort");
-     msg(M_FATAL, "TUN/TAP I/O operation aborted, exiting");
+     register_signal(c, SIGHUP, "tun-abort");
+     c->persist.restart_sleep_seconds = 10;
+     msg(M_INFO, "TUN/TAP I/O operation aborted, restarting");
      perf_pop();
      return;
   }
@@ -1029,6 +1052,8 @@ process_ip_header (struct context *c, unsigned int flags, struct buffer *buf)
   if (!c->options.passtos)
     flags &= ~PIPV4_PASSTOS;
 #endif
+  if (!c->options.client_nat)
+    flags &= ~PIPV4_CLIENT_NAT;
   if (!c->options.route_gateway_via_dhcp)
     flags &= ~PIPV4_EXTRACT_DHCP_ROUTER;
 
@@ -1038,11 +1063,13 @@ process_ip_header (struct context *c, unsigned int flags, struct buffer *buf)
        * The --passtos and --mssfix options require
        * us to examine the IPv4 header.
        */
+
+      if (flags & (PIP_MSSFIX
 #if PASSTOS_CAPABILITY
-      if (flags & (PIPV4_PASSTOS|PIP_MSSFIX))
-#else
-      if (flags & PIP_MSSFIX)
+	  | PIPV4_PASSTOS
 #endif
+	  | PIPV4_CLIENT_NAT
+	  ))
 	{
 	  struct buffer ipbuf = *buf;
 	  if (is_ipv4 (TUNNEL_TYPE (c->c1.tuntap), &ipbuf))
@@ -1057,14 +1084,12 @@ process_ip_header (struct context *c, unsigned int flags, struct buffer *buf)
 	      if (flags & PIP_MSSFIX)
 		mss_fixup_ipv4 (&ipbuf, MTU_TO_MSS (TUN_MTU_SIZE_DYNAMIC (&c->c2.frame)));
 
-#ifdef ENABLE_CLIENT_NAT
 	      /* possibly do NAT on packet */
 	      if ((flags & PIPV4_CLIENT_NAT) && c->options.client_nat)
 		{
 		  const int direction = (flags & PIPV4_OUTGOING) ? CN_INCOMING : CN_OUTGOING;
 		  client_nat_transform (c->options.client_nat, &ipbuf, direction);
 		}
-#endif
 	      /* possibly extract a DHCP router message */
 	      if (flags & PIPV4_EXTRACT_DHCP_ROUTER)
 		{
@@ -1091,6 +1116,7 @@ void
 process_outgoing_link (struct context *c)
 {
   struct gc_arena gc = gc_new ();
+  int error_code = 0;
 
   perf_push (PERF_PROC_OUT_LINK);
 
@@ -1178,6 +1204,7 @@ process_outgoing_link (struct context *c)
 	}
 
       /* Check return status */
+      error_code = openvpn_errno();
       check_status (size, "write", c->c2.link_socket, NULL);
 
       if (size > 0)
@@ -1194,6 +1221,17 @@ process_outgoing_link (struct context *c)
       /* if not a ping/control message, indicate activity regarding --inactive parameter */
       if (c->c2.buf.len > 0 )
         register_activity (c, size);
+
+
+#ifdef ENABLE_CRYPTO
+      /* for unreachable network and "connecting" state switch to the next host */
+      if (size < 0 && ENETUNREACH == error_code && c->c2.tls_multi &&
+          !tls_initial_packet_received (c->c2.tls_multi) && c->options.mode == MODE_POINT_TO_POINT)
+	{
+	  msg (M_INFO, "Network unreachable, restarting");
+	  register_signal (c, SIGUSR1, "network-unreachable");
+	}
+#endif
     }
   else
     {
@@ -1369,6 +1407,9 @@ io_wait_dowork (struct context *c, const unsigned int flags)
 #ifdef ENABLE_MANAGEMENT
   static int management_shift = 6; /* depends on MANAGEMENT_READ and MANAGEMENT_WRITE */
 #endif
+#ifdef ENABLE_ASYNC_PUSH
+  static int file_shift = 8;       /* listening inotify events */
+#endif
 
   /*
    * Decide what kind of events we want to wait for.
@@ -1461,6 +1502,11 @@ io_wait_dowork (struct context *c, const unsigned int flags)
 #ifdef ENABLE_MANAGEMENT
   if (management)
     management_socket_set (management, c->c2.event_set, (void*)&management_shift, NULL);
+#endif
+
+#ifdef ENABLE_ASYNC_PUSH
+  /* arm inotify watcher */
+  event_ctl (c->c2.event_set, c->c2.inotify_fd, EVENT_READ, (void*)&file_shift);
 #endif
 
   /*

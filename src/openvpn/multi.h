@@ -57,6 +57,13 @@ struct multi_reap
 };
 
 
+struct deferred_signal_schedule_entry
+{
+  struct schedule_entry se;
+  int signal_received;
+  struct timeval wakeup;
+};
+
 /**
  * Server-mode state structure for one single VPN tunnel.
  *
@@ -105,6 +112,10 @@ struct multi_instance {
 
   struct context context;       /**< The context structure storing state
                                  *   for this VPN tunnel. */
+
+#ifdef ENABLE_ASYNC_PUSH
+  int inotify_watch; /* watch descriptor for acf */
+#endif
 };
 
 
@@ -172,6 +183,13 @@ struct multi_context {
    * Timer object for stale route check
    */
   struct event_timeout stale_routes_check_et;
+
+#ifdef ENABLE_ASYNC_PUSH
+  /* mapping between inotify watch descriptors and multi_instances */
+  struct hash *inotify_watchers;
+#endif
+
+  struct deferred_signal_schedule_entry deferred_shutdown_signal;
 };
 
 /*
@@ -215,7 +233,7 @@ const char *multi_instance_string (const struct multi_instance *mi, bool null, s
 void multi_init (struct multi_context *m, struct context *t, bool tcp_mode, int thread_mode);
 void multi_uninit (struct multi_context *m);
 
-void multi_top_init (struct multi_context *m, const struct context *top, const bool alloc_buffers);
+void multi_top_init (struct multi_context *m, const struct context *top);
 void multi_top_free (struct multi_context *m);
 
 struct multi_instance *multi_create_instance (struct multi_context *m, const struct mroute_addr *real);
@@ -326,6 +344,18 @@ void multi_close_instance_on_signal (struct multi_context *m, struct multi_insta
 
 void init_management_callback_multi (struct multi_context *m);
 void uninit_management_callback_multi (struct multi_context *m);
+
+
+#ifdef ENABLE_ASYNC_PUSH
+/**
+ * Called when inotify event is fired, which happens when acf file is closed or deleted.
+ * Continues authentication and sends push_repl
+ *
+ * @param m multi_context
+ * @param mpp_flags
+ */
+void multi_process_file_closed (struct multi_context *m, const unsigned int mpp_flags);
+#endif
 
 /*
  * Return true if our output queue is not full
@@ -593,11 +623,6 @@ static inline void
 multi_set_pending (struct multi_context *m, struct multi_instance *mi)
 {
   m->pending = mi;
-}
-
-static inline void
-multi_release_io_lock (struct multi_context *m)
-{
 }
 
 #endif /* P2MP_SERVER */

@@ -44,6 +44,7 @@
 #include "ping.h"
 #include "mstats.h"
 #include "ssl_verify.h"
+#include "forward-inline.h"
 
 #include "memdbg.h"
 
@@ -137,7 +138,6 @@ management_callback_proxy_cmd (void *arg, const char **p)
           ho = init_http_proxy_options_once (&ce->http_proxy_options, gc);
           ho->server = string_alloc (p[2], gc);
           ho->port = string_alloc (p[3], gc);
-          ho->retry = true;
           ho->auth_retry = (p[4] && streq (p[4], "nct") ? PAR_NCT : PAR_ALL);
           ret = true;
         }
@@ -407,8 +407,8 @@ next_connection_entry (struct context *c)
 /*
  * Query for private key and auth-user-pass username/passwords
  */
-static void
-init_query_passwords (struct context *c)
+void
+init_query_passwords (const struct context *c)
 {
 #ifdef ENABLE_CRYPTO
   /* Certificate password input */
@@ -472,8 +472,7 @@ init_proxy_dowork (struct context *c)
     {
       c->c1.socks_proxy = socks_proxy_new (c->options.ce.socks_proxy_server,
 					   c->options.ce.socks_proxy_port,
-					   c->options.ce.socks_proxy_authfile,
-					   c->options.ce.socks_proxy_retry);
+					   c->options.ce.socks_proxy_authfile);
       if (c->c1.socks_proxy)
 	{
 	  c->c1.socks_proxy_owned = true;
@@ -501,8 +500,6 @@ context_init_1 (struct context *c)
   packet_id_persist_init (&c->c1.pid_persist);
 
   init_connection_list (c);
-
-  init_query_passwords (c);
 
 #if defined(ENABLE_PKCS11)
   if (c->first_time) {
@@ -641,8 +638,10 @@ init_static (void)
 #ifdef TEST_GET_DEFAULT_GATEWAY
   {
     struct route_gateway_info rgi;
+    struct route_ipv6_gateway_info rgi6;
     get_default_gateway(&rgi);
-    print_default_gateway(M_INFO, &rgi);
+    get_default_gateway_ipv6(&rgi6, NULL);
+    print_default_gateway(M_INFO, &rgi, &rgi6);
     return false;
   }
 #endif
@@ -822,7 +821,7 @@ void
 init_options_dev (struct options *options)
 {
   if (!options->dev && options->dev_node) {
-    char *dev_node = strdup(options->dev_node); /* POSIX basename() implementaions may modify its arguments */
+    char *dev_node = string_alloc(options->dev_node, NULL); /* POSIX basename() implementaions may modify its arguments */
     options->dev = basename (dev_node);
   }
 }
@@ -950,31 +949,30 @@ do_uid_gid_chroot (struct context *c, bool no_delay)
   static const char why_not[] = "will be delayed because of --client, --pull, or --up-delay";
   struct context_0 *c0 = c->c0;
 
-  if (c->first_time && c0 && !c0->uid_gid_set)
+  if (c0 && !c0->uid_gid_chroot_set)
     {
       /* chroot if requested */
       if (c->options.chroot_dir)
 	{
 	  if (no_delay)
 	    platform_chroot (c->options.chroot_dir);
-	  else
+	  else if (c->first_time)
 	    msg (M_INFO, "NOTE: chroot %s", why_not);
 	}
 
-      /* set user and/or group that we want to setuid/setgid to */
-      if (no_delay)
+      /* set user and/or group if we want to setuid/setgid */
+      if (c0->uid_gid_specified)
 	{
-	  platform_group_set (&c0->platform_state_group);
-	  platform_user_set (&c0->platform_state_user);
-	  c0->uid_gid_set = true;
-	}
-      else if (c0->uid_gid_specified)
-	{
-	  msg (M_INFO, "NOTE: UID/GID downgrade %s", why_not);
+	  if (no_delay) {
+	    platform_group_set (&c0->platform_state_group);
+	    platform_user_set (&c0->platform_state_user);
+	  }
+	  else if (c->first_time)
+	    msg (M_INFO, "NOTE: UID/GID downgrade %s", why_not);
 	}
 
 #ifdef ENABLE_MEMSTATS
-      if (c->options.memstats_fn)
+      if (c->first_time && c->options.memstats_fn)
 	mstats_open(c->options.memstats_fn);
 #endif
 
@@ -993,10 +991,16 @@ do_uid_gid_chroot (struct context *c, bool no_delay)
 	    else
 	      msg (M_INFO, "setcon to '%s' succeeded", c->options.selinux_context);
 	  }
-	  else
+	  else if (c->first_time)
 	    msg (M_INFO, "NOTE: setcon %s", why_not);
 	}
 #endif
+
+      /* Privileges are going to be dropped by now (if requested), be sure
+       * to prevent any future privilege dropping attempts from now on.
+       */
+      if (no_delay)
+	c0->uid_gid_chroot_set = true;
     }
 }
 
@@ -1052,6 +1056,19 @@ reset_coarse_timers (struct context *c)
 }
 
 /*
+ * Initialise the server poll timeout timer
+ * This timer is used in the http/socks proxy setup so it needs to be setup
+ * before
+ */
+static void
+do_init_server_poll_timeout (struct context *c)
+{
+    update_time ();
+    if (c->options.ce.connect_timeout)
+	event_timeout_init (&c->c2.server_poll_interval, c->options.ce.connect_timeout, now);
+}
+
+/*
  * Initialize timers
  */
 static void
@@ -1071,11 +1088,6 @@ do_init_timers (struct context *c, bool deferred)
 
   if (c->options.ping_rec_timeout)
     event_timeout_init (&c->c2.ping_rec_interval, c->options.ping_rec_timeout, now);
-
-#if P2MP
-  if (c->options.server_poll_timeout)
-    event_timeout_init (&c->c2.server_poll_interval, c->options.server_poll_timeout, now);
-#endif
 
   if (!deferred)
     {
@@ -1179,6 +1191,7 @@ do_init_route_list (const struct options *options,
 static void
 do_init_route_ipv6_list (const struct options *options,
 		    struct route_ipv6_list *route_ipv6_list,
+		    const struct link_socket_info *link_socket_info,
 		    bool fatal,
 		    struct env_set *es)
 {
@@ -1194,10 +1207,26 @@ do_init_route_ipv6_list (const struct options *options,
   if (options->route_default_metric)
     metric = options->route_default_metric;
 
+  /* redirect (IPv6) gateway to VPN?  if yes, add a few more specifics
+   */
+  if ( options->routes_ipv6->flags & RG_REROUTE_GW )
+    {
+      char *opt_list[] = { "::/3", "2000::/4", "3000::/4", "fc00::/7", NULL };
+      int i;
+
+      for (i=0; opt_list[i]; i++)
+	{
+	  add_route_ipv6_to_option_list( options->routes_ipv6,
+		      string_alloc (opt_list[i], options->routes_ipv6->gc),
+		      NULL, NULL );
+	}
+    }
+
   if (!init_route_ipv6_list (route_ipv6_list,
 			options->routes_ipv6,
 			gw,
 			metric,
+			link_socket_current_remote_ipv6 (link_socket_info),
 			es))
     {
       if (fatal)
@@ -1251,26 +1280,52 @@ initialization_sequence_completed (struct context *c, const unsigned int flags)
   /* Tell management interface that we initialized */
   if (management)
     {
-      in_addr_t tun_local = 0;
-      in_addr_t tun_remote = 0; /* FKS */
+      in_addr_t *tun_local = NULL;
+      struct in6_addr *tun_local6 = NULL;
+      struct openvpn_sockaddr local, remote;
+      struct link_socket_actual *actual;
+      socklen_t sa_len = sizeof(local);
       const char *detail = "SUCCESS";
-      if (c->c1.tuntap)
-	tun_local = c->c1.tuntap->local;
-      /* TODO(jjo): for ipv6 this will convert some 32bits in the ipv6 addr
-       *            to a meaningless ipv4 address.
-       *            In any case, is somewhat inconsistent to send local tunnel
-       *            addr with remote _endpoint_ addr (?)
-       */
-      tun_remote = htonl (c->c1.link_socket_addr.actual.dest.addr.in4.sin_addr.s_addr);
       if (flags & ISC_ERRORS)
-	detail = "ERROR";
+        detail = "ERROR";
+
+      CLEAR (local);
+      actual = &get_link_socket_info(c)->lsa->actual;
+      remote = actual->dest;
+      getsockname(c->c2.link_socket->sd, &local.addr.sa, &sa_len);
+#if ENABLE_IP_PKTINFO
+      if (!addr_defined(&local))
+        {
+          switch (local.addr.sa.sa_family)
+            {
+            case AF_INET:
+#ifdef IP_PKTINFO
+              local.addr.in4.sin_addr = actual->pi.in4.ipi_spec_dst;
+#else
+              local.addr.in4.sin_addr = actual->pi.in4;
+#endif
+              break;
+            case AF_INET6:
+              local.addr.in6.sin6_addr = actual->pi.in6.ipi6_addr;
+              break;
+            }
+        }
+#endif
+
+      if (c->c1.tuntap)
+        {
+          tun_local = &c->c1.tuntap->local;
+          tun_local6 = &c->c1.tuntap->local_ipv6;
+        }
       management_set_state (management,
 			    OPENVPN_STATE_CONNECTED,
 			    detail,
 			    tun_local,
-			    tun_remote);
+                            tun_local6,
+                            &local,
+                            &remote);
       if (tun_local)
-	management_post_tunnel_open (management, tun_local);
+	management_post_tunnel_open (management, *tun_local);
     }
 #endif
 }
@@ -1384,6 +1439,12 @@ do_open_tun (struct context *c)
       /* initialize (but do not open) tun/tap object */
       do_init_tun (c);
 
+#ifdef WIN32
+      /* store (hide) interactive service handle in tuntap_options */
+      c->c1.tuntap->options.msg_channel = c->options.msg_channel;
+      msg (D_ROUTE, "interactive service msg_channel=%u", (unsigned int) c->options.msg_channel);
+#endif
+
       /* allocate route list structure */
       do_alloc_route_list (c);
 
@@ -1391,7 +1452,7 @@ do_open_tun (struct context *c)
       if (c->options.routes && c->c1.route_list && c->c2.link_socket)
 	do_init_route_list (&c->options, c->c1.route_list, &c->c2.link_socket->info, false, c->c2.es);
       if (c->options.routes_ipv6 && c->c1.route_ipv6_list )
-	do_init_route_ipv6_list (&c->options, c->c1.route_ipv6_list, false, c->c2.es);
+	do_init_route_ipv6_list (&c->options, c->c1.route_ipv6_list, &c->c2.link_socket->info, false, c->c2.es);
 
       /* do ifconfig */
       if (!c->options.ifconfig_noexec
@@ -1436,6 +1497,9 @@ do_open_tun (struct context *c)
 		   c->plugins,
 		   OPENVPN_PLUGIN_UP,
 		   c->c1.tuntap->actual_name,
+#ifdef WIN32
+		   c->c1.tuntap->adapter_index,
+#endif
 		   dev_type_string (c->options.dev, c->options.dev_type),
 		   TUN_MTU_SIZE (&c->c2.frame),
 		   EXPANDED_SIZE (&c->c2.frame),
@@ -1445,6 +1509,15 @@ do_open_tun (struct context *c)
 		   NULL,
 		   "up",
 		   c->c2.es);
+
+#if defined(WIN32)
+      if (c->options.block_outside_dns)
+      {
+        dmsg (D_LOW, "Blocking outside DNS");
+        if (!win_wfp_block_dns(c->c1.tuntap->adapter_index, c->options.msg_channel))
+            msg (M_FATAL, "Blocking DNS failed!");
+      }
+#endif
 
       /* possibly add routes */
       if ((route_order() == ROUTE_AFTER_TUN) && (!c->options.route_delay_defined))
@@ -1477,6 +1550,9 @@ do_open_tun (struct context *c)
 		     c->plugins,
 		     OPENVPN_PLUGIN_UP,
 		     c->c1.tuntap->actual_name,
+#ifdef WIN32
+		     c->c1.tuntap->adapter_index,
+#endif
 		     dev_type_string (c->options.dev, c->options.dev_type),
 		     TUN_MTU_SIZE (&c->c2.frame),
 		     EXPANDED_SIZE (&c->c2.frame),
@@ -1486,6 +1562,15 @@ do_open_tun (struct context *c)
 		     NULL,
 		     "up",
 		     c->c2.es);
+#if defined(WIN32)
+      if (c->options.block_outside_dns)
+        {
+          dmsg (D_LOW, "Blocking outside DNS");
+          if (!win_wfp_block_dns(c->c1.tuntap->adapter_index, c->options.msg_channel))
+            msg (M_FATAL, "Blocking DNS failed!");
+        }
+#endif
+
     }
 #endif
   gc_free (&gc);
@@ -1515,6 +1600,9 @@ do_close_tun (struct context *c, bool force)
   if (c->c1.tuntap && c->c1.tuntap_owned)
     {
       const char *tuntap_actual = string_alloc (c->c1.tuntap->actual_name, &gc);
+#ifdef WIN32
+      DWORD adapter_index = c->c1.tuntap->adapter_index;
+#endif
       const in_addr_t local = c->c1.tuntap->local;
       const in_addr_t remote_netmask = c->c1.tuntap->remote_netmask;
 
@@ -1538,6 +1626,9 @@ do_close_tun (struct context *c, bool force)
                            c->plugins,
                            OPENVPN_PLUGIN_ROUTE_PREDOWN,
                            tuntap_actual,
+#ifdef WIN32
+                           adapter_index,
+#endif
                            NULL,
                            TUN_MTU_SIZE (&c->c2.frame),
                            EXPANDED_SIZE (&c->c2.frame),
@@ -1563,6 +1654,9 @@ do_close_tun (struct context *c, bool force)
 		       c->plugins,
 		       OPENVPN_PLUGIN_DOWN,
 		       tuntap_actual,
+#ifdef WIN32
+		       adapter_index,
+#endif
 		       NULL,
 		       TUN_MTU_SIZE (&c->c2.frame),
 		       EXPANDED_SIZE (&c->c2.frame),
@@ -1573,6 +1667,14 @@ do_close_tun (struct context *c, bool force)
 					   c->sig->signal_text),
 		       "down",
 		       c->c2.es);
+
+#if defined(WIN32)
+            if (c->options.block_outside_dns)
+            {
+                if (!win_wfp_uninit(c->options.msg_channel))
+                    msg (M_FATAL, "Uninitialising WFP failed!");
+            }
+#endif
 
 	  /* actually close tun/tap device based on --down-pre flag */
 	  if (c->options.down_pre)
@@ -1586,6 +1688,9 @@ do_close_tun (struct context *c, bool force)
 			 c->plugins,
 			 OPENVPN_PLUGIN_DOWN,
 			 tuntap_actual,
+#ifdef WIN32
+			 adapter_index,
+#endif
 			 NULL,
 			 TUN_MTU_SIZE (&c->c2.frame),
 			 EXPANDED_SIZE (&c->c2.frame),
@@ -1596,6 +1701,15 @@ do_close_tun (struct context *c, bool force)
 					     c->sig->signal_text),
 			 "down",
 			 c->c2.es);
+
+#if defined(WIN32)
+          if (c->options.block_outside_dns)
+            {
+              if (!win_wfp_uninit(c->options.msg_channel))
+                  msg (M_FATAL, "Uninitialising WFP failed!");
+            }
+#endif
+
 	}
     }
   gc_free (&gc);
@@ -1622,15 +1736,16 @@ tun_abort()
  * equal, or either one is all-zeroes.
  */
 static bool
-options_hash_changed_or_zero(const uint8_t (*a)[MD5_DIGEST_LENGTH],
-    const uint8_t (*b)[MD5_DIGEST_LENGTH])
+options_hash_changed_or_zero(const struct md5_digest *a,
+    const struct md5_digest *b)
 {
-  const uint8_t zero[MD5_DIGEST_LENGTH] = {0};
-  return memcmp (*a, *b, MD5_DIGEST_LENGTH) || memcmp (*a, zero, MD5_DIGEST_LENGTH);
+  const struct md5_digest zero = {{0}};
+  return memcmp (a, b, sizeof(struct md5_digest)) ||
+      !memcmp (a, &zero, sizeof(struct md5_digest));
 }
 #endif /* P2MP */
 
-void
+bool
 do_up (struct context *c, bool pulled_options, unsigned int option_types_found)
 {
   if (!c->c2.do_up_ran)
@@ -1638,7 +1753,13 @@ do_up (struct context *c, bool pulled_options, unsigned int option_types_found)
       reset_coarse_timers (c);
 
       if (pulled_options && option_types_found)
-	do_deferred_options (c, option_types_found);
+	{
+	  if (!do_deferred_options (c, option_types_found))
+	    {
+	      msg (D_PUSH_ERRORS, "ERROR: Failed to apply push options");
+	      return false;
+	    }
+	}
 
       /* if --up-delay specified, open tun, do ifconfig, and run up script now */
       if (c->options.up_delay || PULL_DEFINED (&c->options))
@@ -1670,8 +1791,7 @@ do_up (struct context *c, bool pulled_options, unsigned int option_types_found)
       if (c->c2.did_open_tun)
 	{
 #if P2MP
-	  memcpy(c->c1.pulled_options_digest_save, c->c2.pulled_options_digest,
-	      sizeof(c->c1.pulled_options_digest_save));
+	  c->c1.pulled_options_digest_save = c->c2.pulled_options_digest;
 #endif
 
 	  /* if --route-delay was specified, start timer */
@@ -1694,6 +1814,7 @@ do_up (struct context *c, bool pulled_options, unsigned int option_types_found)
 	
       c->c2.do_up_ran = true;
     }
+  return true;
 }
 
 /*
@@ -1721,13 +1842,18 @@ pull_permission_mask (const struct context *c)
   if (!c->options.route_nopull)
     flags |= (OPT_P_ROUTE | OPT_P_IPWIN32);
 
+#ifdef ENABLE_CRYPTO
+  if (c->options.ncp_enabled)
+    flags |= OPT_P_NCP;
+#endif
+
   return flags;
 }
 
 /*
  * Handle non-tun-related pulled options.
  */
-void
+bool
 do_deferred_options (struct context *c, const unsigned int found)
 {
   if (found & OPT_P_MESSAGES)
@@ -1814,7 +1940,23 @@ do_deferred_options (struct context *c, const unsigned int found)
                        " MTU problems", TUN_MTU_SIZE(&c->c2.frame) );
 	}
     }
+
+  /* process (potentially pushed) crypto options */
+  if (c->options.pull)
+    {
+      struct tls_session *session = &c->c2.tls_multi->session[TM_ACTIVE];
+      if (found & OPT_P_NCP)
+	msg (D_PUSH, "OPTIONS IMPORT: data channel crypto options modified");
+      /* Do not regenerate keys if server sends an extra push request */
+      if (!session->key[KS_PRIMARY].crypto_options.key_ctx_bi.initialized &&
+	  !tls_session_update_crypto_params(session, &c->options, &c->c2.frame))
+	{
+	  msg (D_TLS_ERRORS, "OPTIONS ERROR: failed to import crypto options");
+	  return false;
+	}
+    }
 #endif
+  return true;
 }
 
 /*
@@ -1841,6 +1983,7 @@ static void
 socket_restart_pause (struct context *c)
 {
   int sec = 2;
+  int backoff = 0;
 
   switch (c->options.ce.proto)
     {
@@ -1861,12 +2004,21 @@ socket_restart_pause (struct context *c)
 #if P2MP
   if (auth_retry_get () == AR_NOINTERACT)
     sec = 10;
+#endif
 
-#if 0 /* not really needed because of c->persist.restart_sleep_seconds */
-  if (c->options.server_poll_timeout && sec > 1)
-    sec = 1;
-#endif
-#endif
+  /* Slow down reconnection after 5 retries per remote -- for tcp only in client mode */
+  if (c->options.ce.proto != PROTO_TCP_SERVER)
+    {
+      backoff = (c->options.unsuccessful_attempts / c->options.connection_list->len) - 4;
+      if (backoff > 0)
+        {
+          /* sec is less than 2^16; we can left shift it by up to 15 bits without overflow */
+          sec = max_int (sec, 1) << min_int (backoff, 15);
+        }
+
+      if (sec > c->options.ce.connect_retry_seconds_max)
+        sec = c->options.ce.connect_retry_seconds_max;
+    }
 
   if (c->persist.restart_sleep_seconds > 0 && c->persist.restart_sleep_seconds > sec)
     sec = c->persist.restart_sleep_seconds;
@@ -1919,6 +2071,7 @@ frame_finalize_options (struct context *c, const struct options *o)
 			    |FRAME_HEADROOM_MARKER_READ_STREAM);
     }
   
+  frame_add_to_extra_buffer (&c->c2.frame, PAYLOAD_ALIGN);
   frame_finalize (&c->c2.frame,
 		  o->ce.link_mtu_defined,
 		  o->ce.link_mtu,
@@ -1958,14 +2111,6 @@ init_crypto_pre (struct context *c, const unsigned int flags)
 	packet_id_persist_load (&c->c1.pid_persist, c->options.packet_id_file);
     }
 
-  /* Initialize crypto options */
-
-  if (c->options.use_iv)
-    c->c2.crypto_options.flags |= CO_USE_IV;
-
-  if (c->options.mute_replay_warnings)
-    c->c2.crypto_options.flags |= CO_MUTE_REPLAY_WARNINGS;
-
 #ifdef ENABLE_PREDICTION_RESISTANCE
   if (c->options.use_prediction_resistance)
     rand_ctx_enable_prediction_resistance();
@@ -1984,19 +2129,25 @@ do_init_crypto_static (struct context *c, const unsigned int flags)
 
   init_crypto_pre (c, flags);
 
+  /* Initialize flags */
+  if (c->options.use_iv)
+    c->c2.crypto_options.flags |= CO_USE_IV;
+
+  if (c->options.mute_replay_warnings)
+    c->c2.crypto_options.flags |= CO_MUTE_REPLAY_WARNINGS;
+
   /* Initialize packet ID tracking */
   if (options->replay)
     {
-      packet_id_init (&c->c2.packet_id,
+      packet_id_init (&c->c2.crypto_options.packet_id,
 		      link_socket_proto_connection_oriented (options->ce.proto),
 		      options->replay_window,
 		      options->replay_time,
 		      "STATIC", 0);
-      c->c2.crypto_options.packet_id = &c->c2.packet_id;
       c->c2.crypto_options.pid_persist = &c->c1.pid_persist;
       c->c2.crypto_options.flags |= CO_PACKET_ID_LONG_FORM;
       packet_id_persist_load_obj (&c->c1.pid_persist,
-				  c->c2.crypto_options.packet_id);
+				  &c->c2.crypto_options.packet_id);
     }
 
   if (!key_ctx_bi_defined (&c->c1.ks.static_key))
@@ -2045,7 +2196,7 @@ do_init_crypto_static (struct context *c, const unsigned int flags)
     }
 
   /* Get key schedule */
-  c->c2.crypto_options.key_ctx_bi = &c->c1.ks.static_key;
+  c->c2.crypto_options.key_ctx_bi = c->c1.ks.static_key;
 
   /* Compute MTU parameters */
   crypto_adjust_frame_parameters (&c->c2.frame,
@@ -2116,12 +2267,27 @@ do_init_crypto_tls_c1 (struct context *c)
 	      flags |= GHK_INLINE;
 	      file = options->tls_auth_file_inline;
 	    }
-	  get_tls_handshake_key (&c->c1.ks.key_type,
-				 &c->c1.ks.tls_auth_key,
-				 file,
-				 options->key_direction,
-				 flags);
+
+	  /* Initialize key_type for tls-auth with auth only */
+	  CLEAR (c->c1.ks.tls_auth_key_type);
+	  if (options->authname && options->authname_defined)
+	    {
+	      c->c1.ks.tls_auth_key_type.digest = md_kt_get (options->authname);
+	      c->c1.ks.tls_auth_key_type.hmac_length =
+		  md_kt_size (c->c1.ks.tls_auth_key_type.digest);
+	    }
+	  else
+	    {
+	      msg (M_FATAL, "ERROR: tls-auth enabled, but no valid --auth "
+		  "algorithm specified ('%s')", options->authname);
+	    }
+
+	  get_tls_handshake_key (&c->c1.ks.tls_auth_key_type,
+	      &c->c1.ks.tls_auth_key, file, options->key_direction, flags);
 	}
+
+      c->c1.ciphername = options->ciphername;
+      c->c1.authname = options->authname;
 
 #if 0 /* was: #if ENABLE_INLINE_FILES --  Note that enabling this code will break restarts */
       if (options->priv_key_file_inline)
@@ -2164,16 +2330,28 @@ do_init_crypto_tls (struct context *c, const unsigned int flags)
   /* In short form, unique datagram identifier is 32 bits, in long form 64 bits */
   packet_id_long_form = cipher_kt_mode_ofb_cfb (c->c1.ks.key_type.cipher);
 
-  /* Compute MTU parameters */
-  crypto_adjust_frame_parameters (&c->c2.frame,
-				  &c->c1.ks.key_type,
-				  options->ciphername_defined,
-				  options->use_iv,
-				  options->replay, packet_id_long_form);
+  /* Compute MTU parameters (postpone if we pull options) */
+  if (c->options.pull)
+    {
+      /* Account for worst-case crypto overhead before allocating buffers */
+      frame_add_to_extra_frame (&c->c2.frame, crypto_max_overhead());
+    }
+  else
+    {
+      crypto_adjust_frame_parameters(&c->c2.frame, &c->c1.ks.key_type,
+	  options->ciphername_defined, options->use_iv, options->replay,
+	  packet_id_long_form);
+    }
   tls_adjust_frame_parameters (&c->c2.frame);
 
   /* Set all command-line TLS-related options */
   CLEAR (to);
+
+  if (options->use_iv)
+    to.crypto_flags |= CO_USE_IV;
+
+  if (options->mute_replay_warnings)
+    to.crypto_flags |= CO_MUTE_REPLAY_WARNINGS;
 
   to.crypto_flags_and = ~(CO_PACKET_ID_LONG_FORM);
   if (packet_id_long_form)
@@ -2187,6 +2365,9 @@ do_init_crypto_tls (struct context *c, const unsigned int flags)
   to.replay_window = options->replay_window;
   to.replay_time = options->replay_time;
   to.tcp_mode = link_socket_proto_connection_oriented (options->ce.proto);
+  to.config_ciphername = c->c1.ciphername;
+  to.config_authname = c->c1.authname;
+  to.ncp_enabled = options->ncp_enabled;
   to.transition_window = options->transition_window;
   to.handshake_window = options->handshake_window;
   to.packet_timeout = options->tls_timeout;
@@ -2194,6 +2375,7 @@ do_init_crypto_tls (struct context *c, const unsigned int flags)
   to.renegotiate_packets = options->renegotiate_packets;
   to.renegotiate_seconds = options->renegotiate_seconds;
   to.single_session = options->single_session;
+  to.pull = options->pull;
 #ifdef ENABLE_PUSH_PEER_INFO
   if (options->push_peer_info)		/* all there is */
     to.push_peer_info_detail = 2;
@@ -2217,6 +2399,7 @@ do_init_crypto_tls (struct context *c, const unsigned int flags)
   to.verify_x509_type = (options->verify_x509_type & 0xff);
   to.verify_x509_name = options->verify_x509_name;
   to.crl_file = options->crl_file;
+  to.crl_file_inline = options->crl_file_inline;
   to.ssl_flags = options->ssl_flags;
   to.ns_cert_type = options->ns_cert_type;
   memmove (to.remote_cert_ku, options->remote_cert_ku, sizeof (to.remote_cert_ku));
@@ -2248,9 +2431,7 @@ do_init_crypto_tls (struct context *c, const unsigned int flags)
   to.auth_user_pass_file = options->auth_user_pass_file;
 #endif
 
-#ifdef ENABLE_X509_TRACK
   to.x509_track = options->x509_track;
-#endif
 
 #if P2MP
 #ifdef ENABLE_CLIENT_CR
@@ -2262,14 +2443,30 @@ do_init_crypto_tls (struct context *c, const unsigned int flags)
   to.comp_options = options->comp;
 #endif
 
+#if defined(ENABLE_CRYPTO_OPENSSL) && OPENSSL_VERSION_NUMBER >= 0x10001000
+  if (options->keying_material_exporter_label)
+    {
+      to.ekm_size = options->keying_material_exporter_length;
+      if (to.ekm_size < 16 || to.ekm_size > 4095)
+          to.ekm_size = 0;
+
+      to.ekm_label = options->keying_material_exporter_label;
+      to.ekm_label_size = strlen(to.ekm_label);
+    }
+  else
+    {
+      to.ekm_size = 0;
+    }
+#endif
+
   /* TLS handshake authentication (--tls-auth) */
   if (options->tls_auth_file)
     {
-      to.tls_auth_key = c->c1.ks.tls_auth_key;
+      to.tls_auth.key_ctx_bi = c->c1.ks.tls_auth_key;
       to.tls_auth.pid_persist = &c->c1.pid_persist;
       to.tls_auth.flags |= CO_PACKET_ID_LONG_FORM;
       crypto_adjust_frame_parameters (&to.frame,
-				      &c->c1.ks.key_type,
+				      &c->c1.ks.tls_auth_key_type,
 				      false, false, true, true);
     }
 
@@ -2346,11 +2543,11 @@ do_init_frame (struct context *c)
     {
       comp_add_to_extra_frame (&c->c2.frame);
 
-#if !defined(ENABLE_SNAPPY) && !defined(ENABLE_LZ4)
+#if !defined(ENABLE_LZ4)
       /*
        * Compression usage affects buffer alignment when non-swapped algs
        * such as LZO is used.
-       * Newer algs like Snappy and comp-stub with COMP_F_SWAP don't need
+       * Newer algs like LZ4 and comp-stub with COMP_F_SWAP don't need
        * any special alignment because of the control-byte swap approach.
        * LZO alignment (on the other hand) is problematic because
        * the presence of the control byte means that either the output of
@@ -2361,7 +2558,7 @@ do_init_frame (struct context *c)
        * dispatch if packet is uncompressed) at the cost of requiring
        * decryption output to be written to an unaligned buffer, so
        * it's more of a tradeoff than an optimal solution and we don't
-       * include it when we are doing a modern build with Snappy or LZ4.
+       * include it when we are doing a modern build with LZ4.
        * Strictly speaking, on the server it would be better to execute
        * this code for every connection after we decide the compression
        * method, but currently the frame code doesn't appear to be
@@ -2521,11 +2718,6 @@ do_option_warnings (struct context *c)
     msg (M_WARN, "WARNING: No server certificate verification method has been enabled.  See http://openvpn.net/howto.html#mitm for more info.");
 #endif
 
-#ifndef CONNECT_NONBLOCK
-  if (o->ce.connect_timeout_defined)
-    msg (M_WARN, "NOTE: --connect-timeout option is not supported on this OS");
-#endif
-
   /* If a script is used, print appropiate warnings */
   if (o->user_script_used)
    {
@@ -2680,11 +2872,11 @@ do_init_socket_1 (struct context *c, const int mode)
 			   c->options.ipchange,
 			   c->plugins,
 			   c->options.resolve_retry_seconds,
-			   c->options.ce.connect_timeout,
 			   c->options.ce.mtu_discover_type,
 			   c->options.rcvbuf,
 			   c->options.sndbuf,
 			   c->options.mark,
+			   &c->c2.server_poll_interval,
 			   sockflags);
 }
 
@@ -2764,15 +2956,9 @@ do_init_first_time (struct context *c)
 	platform_group_get (c->options.groupname, &c0->platform_state_group) |
 	platform_user_get (c->options.username, &c0->platform_state_user);
 
-      /* get --writepid file descriptor */
-      get_pid_file (c->options.writepid, &c0->pid_state);
-
       /* perform postponed chdir if --daemon */
       if (c->did_we_daemonize && c->options.cd_dir == NULL)
 	platform_chdir("/");
-
-      /* save process ID in a file */
-      write_pid (&c0->pid_state);
 
       /* should we change scheduling priority? */
       platform_nice (c->options.nice);
@@ -2890,7 +3076,7 @@ static void
 do_close_packet_id (struct context *c)
 {
 #ifdef ENABLE_CRYPTO
-  packet_id_free (&c->c2.packet_id);
+  packet_id_free (&c->c2.crypto_options.packet_id);
   packet_id_persist_save (&c->c1.pid_persist);
   if (!(c->sig->signal_received == SIGUSR1))
     packet_id_persist_close (&c->c1.pid_persist);
@@ -3166,6 +3352,37 @@ management_show_net_callback (void *arg, const int msglevel)
 #endif
 }
 
+#ifdef TARGET_ANDROID
+int
+management_callback_network_change (void *arg, bool samenetwork)
+{
+    /* Check if the client should translate the network change to a SIGUSR1 to
+     reestablish the connection or just reprotect the socket
+
+     At the moment just assume that, for all settings that use pull (not
+     --static) and are not using peer-id reestablishing the connection is
+     required (unless the network is the same)
+
+     The function returns -1 on invalid fd and -2 if the socket cannot be
+     reused. On the -2 return value the man_network_change function triggers
+     a SIGUSR1 to force a reconnect.
+    */
+
+  int socketfd=-1;
+  struct context *c = (struct context *) arg;
+  if (!c->c2.link_socket)
+    return -1;
+  if (c->c2.link_socket->sd == SOCKET_UNDEFINED)
+    return -1;
+
+  socketfd = c->c2.link_socket->sd;
+  if (!c->options.pull || c->c2.tls_multi->use_peer_id || samenetwork)
+    return socketfd;
+  else
+    return -2;
+}
+#endif
+
 #endif
 
 void
@@ -3181,6 +3398,9 @@ init_management_callback_p2p (struct context *c)
       cb.show_net = management_show_net_callback;
       cb.proxy_cmd = management_callback_proxy_cmd;
       cb.remote_cmd = management_callback_remote_cmd;
+#ifdef TARGET_ANDROID
+      cb.network_change = management_callback_network_change;
+#endif
       management_set_callback (management, &cb);
     }
 #endif
@@ -3222,8 +3442,10 @@ open_management (struct context *c)
 	      management_set_state (management,
 				    OPENVPN_STATE_CONNECTING,
 				    NULL,
-				    (in_addr_t)0,
-				    (in_addr_t)0);
+                                    NULL,
+                                    NULL,
+                                    NULL,
+                                    NULL);
 	    }
 
 	  /* initial management hold, called early, before first context initialization */
@@ -3484,6 +3706,9 @@ init_instance (struct context *c, const struct env_set *env, const unsigned int 
    */
   do_uid_gid_chroot (c, c->c2.did_open_tun);
 
+  /* initialise connect timeout timer */
+  do_init_server_poll_timeout(c);
+
   /* finalize the TCP/UDP socket */
   if (c->mode == CM_P2P || c->mode == CM_TOP || c->mode == CM_CHILD_TCP)
     do_init_socket_2 (c);
@@ -3622,6 +3847,7 @@ inherit_context_child (struct context *dest,
   /* inherit SSL context */
   dest->c1.ks.ssl_ctx = src->c1.ks.ssl_ctx;
   dest->c1.ks.tls_auth_key = src->c1.ks.tls_auth_key;
+  dest->c1.ks.tls_auth_key_type = src->c1.ks.tls_auth_key_type;
 #endif
 
   /* options */
@@ -3769,13 +3995,13 @@ test_crypto_thread (void *arg)
   test_crypto (&c->c2.crypto_options, &c->c2.frame);
 
   key_schedule_free (&c->c1.ks, true);
-  packet_id_free (&c->c2.packet_id);
+  packet_id_free (&c->c2.crypto_options.packet_id);
 
   context_gc_free (c);
   return NULL;
 }
 
-#endif
+#endif /* ENABLE_CRYPTO */
 
 bool
 do_test_crypto (const struct options *o)

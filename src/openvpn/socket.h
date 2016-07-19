@@ -42,11 +42,6 @@
 #define OPENVPN_PORT "1194"
 
 /*
- * Maximum size passed passed to setsockopt SNDBUF/RCVBUF
- */
-#define SOCKET_SND_RCV_BUF_MAX 1000000
-
-/*
  * Number of seconds that "resolv-retry infinite"
  * represents.
  */
@@ -205,7 +200,6 @@ struct link_socket
   int mode;
 
   int resolve_retry_seconds;
-  int connect_timeout;
   int mtu_discover_type;
 
   struct socket_buffer_size socket_buffer_sizes;
@@ -235,6 +229,10 @@ struct link_socket
   /* The OpenVPN server we will use the proxy to connect to */
   const char *proxy_dest_host;
   const char *proxy_dest_port;
+
+ /* Pointer to the server-poll to trigger the timeout in function which have
+  * their own loop instead of using the main oop */
+  struct event_timeout* server_poll_timeout;
 
 #if PASSTOS_CAPABILITY
   /* used to get/set TOS. */
@@ -324,11 +322,11 @@ link_socket_init_phase1 (struct link_socket *sock,
 			 const char *ipchange_command,
 			 const struct plugin_list *plugins,
 			 int resolve_retry_seconds,
-			 int connect_timeout,
 			 int mtu_discover_type,
 			 int rcvbuf,
 			 int sndbuf,
 			 int mark,
+			 struct event_timeout* server_poll_timeout,
 			 unsigned int sockflags);
 
 void link_socket_init_phase2 (struct link_socket *sock,
@@ -349,6 +347,7 @@ void sd_close (socket_descriptor_t *sd);
 #define PS_SHOW_PORT            (1<<1)
 #define PS_SHOW_PKTINFO         (1<<2)
 #define PS_DONT_SHOW_ADDR       (1<<3)
+#define PS_DONT_SHOW_FAMILY     (1<<4)
 
 const char *print_sockaddr_ex (const struct sockaddr *addr,
 			       const char* separator,
@@ -407,6 +406,11 @@ void setenv_in_addr_t (struct env_set *es,
 		       in_addr_t addr,
 		       const unsigned int flags);
 
+void setenv_in6_addr (struct env_set *es,
+                      const char *name_prefix,
+                      const struct in6_addr *addr,
+                      const unsigned int flags);
+
 void setenv_link_socket_actual (struct env_set *es,
 				const char *name_prefix,
 				const struct link_socket_actual *act,
@@ -419,6 +423,8 @@ void bad_address_length (int actual, int expected);
  */
 #define IPV4_INVALID_ADDR 0xffffffff
 in_addr_t link_socket_current_remote (const struct link_socket_info *info);
+const struct in6_addr * link_socket_current_remote_ipv6
+				     (const struct link_socket_info *info);
 
 void link_socket_connection_initiated (const struct buffer *buf,
 				       struct link_socket_info *info,
@@ -958,7 +964,6 @@ link_socket_read_udp_win32 (struct link_socket *sock,
 
 int link_socket_read_udp_posix (struct link_socket *sock,
 				struct buffer *buf,
-				int maxsize,
 				struct link_socket_actual *from);
 
 #endif
@@ -967,7 +972,6 @@ int link_socket_read_udp_posix (struct link_socket *sock,
 static inline int
 link_socket_read (struct link_socket *sock,
 		  struct buffer *buf,
-		  int maxsize,
 		  struct link_socket_actual *from)
 {
   if (proto_is_udp(sock->info.proto)) /* unified UDPv4 and UDPv6 */
@@ -977,7 +981,7 @@ link_socket_read (struct link_socket *sock,
 #ifdef WIN32
       res = link_socket_read_udp_win32 (sock, buf, from);
 #else
-      res = link_socket_read_udp_posix (sock, buf, maxsize, from);
+      res = link_socket_read_udp_posix (sock, buf, from);
 #endif
       return res;
     }

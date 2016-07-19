@@ -71,17 +71,15 @@ struct options_pre_pull
   bool routes_ipv6_defined;
   struct route_ipv6_option_list *routes_ipv6;
 
-#ifdef ENABLE_CLIENT_NAT
   bool client_nat_defined;
   struct client_nat_option_list *client_nat;
-#endif
 
   int foreign_option_index;
 };
 
 #endif
-#if defined(ENABLE_CRYPTO) && !defined(ENABLE_CRYPTO_OPENSSL) && !defined(ENABLE_CRYPTO_POLARSSL)
-# error "At least one of OpenSSL or PolarSSL needs to be defined."
+#if defined(ENABLE_CRYPTO) && !defined(ENABLE_CRYPTO_OPENSSL) && !defined(ENABLE_CRYPTO_MBEDTLS)
+# error "At least one of OpenSSL or mbed TLS needs to be defined."
 #endif
 
 struct connection_entry
@@ -98,13 +96,12 @@ struct connection_entry
   bool bind_ipv6_only;
   bool bind_local;
   int connect_retry_seconds;
+  int connect_retry_seconds_max;
   int connect_timeout;
-  bool connect_timeout_defined;
   struct http_proxy_options *http_proxy_options;
   const char *socks_proxy_server;
   const char *socks_proxy_port;
   const char *socks_proxy_authfile;
-  bool socks_proxy_retry;
 
   int tun_mtu;           /* MTU of tun device */
   bool tun_mtu_defined;  /* true if user overriding parm with command line option */
@@ -120,9 +117,7 @@ struct connection_entry
   int mssfix;            /* Upper bound on TCP MSS */
   bool mssfix_default;   /* true if --mssfix was supplied without a parameter */
 
-#ifdef ENABLE_OCC
-  int explicit_exit_notification;  /* Explicitly tell peer when we are exiting via OCC_EXIT message */
-#endif
+  int explicit_exit_notification;  /* Explicitly tell peer when we are exiting via OCC_EXIT or [RESTART] message */
 
 # define CE_DISABLED (1<<0)
 # define CE_MAN_QUERY_PROXY (1<<1)
@@ -346,10 +341,7 @@ struct options
   bool route_nopull;
   bool route_gateway_via_dhcp;
   bool allow_pull_fqdn; /* as a client, allow server to push a FQDN for certain parameters */
-
-#ifdef ENABLE_CLIENT_NAT
   struct client_nat_option_list *client_nat;
-#endif
 
 #ifdef ENABLE_OCC
   /* Enable options consistency check between peers */
@@ -431,9 +423,7 @@ struct options
   bool push_ifconfig_defined;
   in_addr_t push_ifconfig_local;
   in_addr_t push_ifconfig_remote_netmask;
-#ifdef ENABLE_CLIENT_NAT
   in_addr_t push_ifconfig_local_alias;
-#endif
   bool push_ifconfig_constraint_defined;
   in_addr_t push_ifconfig_constraint_network;
   in_addr_t push_ifconfig_constraint_netmask;
@@ -441,6 +431,7 @@ struct options
   struct in6_addr push_ifconfig_ipv6_local;		/* IPv6 */
   int 		  push_ifconfig_ipv6_netbits;		/* IPv6 */
   struct in6_addr push_ifconfig_ipv6_remote;		/* IPv6 */
+  bool            push_ifconfig_ipv6_blocked;		/* IPv6 */
   bool enable_c2c;
   bool duplicate_cn;
   int cf_max;
@@ -466,8 +457,6 @@ struct options
   const char *auth_user_pass_file;
   struct options_pre_pull *pre_pull;
 
-  int server_poll_timeout;
-
   int scheduled_exit_interval;
 
 #ifdef ENABLE_CLIENT_CR
@@ -482,6 +471,8 @@ struct options
   int key_direction;
   bool ciphername_defined;
   const char *ciphername;
+  bool ncp_enabled;
+  const char *ncp_ciphers;
   bool authname_defined;
   const char *authname;
   int keysize;
@@ -520,6 +511,7 @@ struct options
   const char *ca_file_inline;
   const char *cert_file_inline;
   const char *extra_certs_file_inline;
+  const char *crl_file_inline;
   char *priv_key_file_inline;
   const char *dh_file_inline;
   const char *pkcs12_file_inline; /* contains the base64 encoding of pkcs12 file */
@@ -582,22 +574,30 @@ struct options
 
 #endif /* ENABLE_CRYPTO */
 
-#ifdef ENABLE_X509_TRACK
   const struct x509_track *x509_track;
-#endif
 
   /* special state parms */
   int foreign_option_index;
 
 #ifdef WIN32
+  HANDLE msg_channel;
   const char *exit_event_name;
   bool exit_event_initial_state;
   bool show_net_up;
   int route_method;
+  bool block_outside_dns;
 #endif
 
   bool use_peer_id;
   uint32_t peer_id;
+
+#if defined(ENABLE_CRYPTO_OPENSSL) && OPENSSL_VERSION_NUMBER >= 0x10001000
+  /* Keying Material Exporters [RFC 5705] */
+  const char *keying_material_exporter_label;
+  int keying_material_exporter_length;
+#endif
+
+  struct pull_filter_list *pull_filter_list;
 };
 
 #define streq(x, y) (!strcmp((x), (y)))
@@ -617,7 +617,7 @@ struct options
 #define OPT_P_PERSIST_IP      (1<<9)
 #define OPT_P_COMP            (1<<10) /* TODO */
 #define OPT_P_MESSAGES        (1<<11)
-#define OPT_P_CRYPTO          (1<<12) /* TODO */
+#define OPT_P_NCP             (1<<12) /**< Negotiable crypto parameters */
 #define OPT_P_TLS_PARMS       (1<<13) /* TODO */
 #define OPT_P_MTU             (1<<14) /* TODO */
 #define OPT_P_NICE            (1<<15)
@@ -689,6 +689,10 @@ void notnull (const char *arg, const char *description);
 void usage_small (void);
 
 void show_library_versions(const unsigned int flags);
+
+#ifdef WIN32
+void show_windows_version(const unsigned int flags);
+#endif
 
 void init_options (struct options *o, const bool init_gc);
 void uninit_options (struct options *o);
@@ -778,8 +782,7 @@ void options_string_import (struct options *options,
 			    struct env_set *es);
 
 bool get_ipv6_addr( const char * prefix_str, struct in6_addr *network,
-		    unsigned int * netbits, char ** printable_ipv6, 
-		    int msglevel );
+		    unsigned int * netbits, int msglevel );
 
 
 #endif

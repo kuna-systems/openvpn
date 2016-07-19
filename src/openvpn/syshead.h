@@ -45,6 +45,11 @@
 #define srandom srand
 #endif
 
+#ifdef _MSC_VER // Visual Studio
+#define __func__ __FUNCTION__
+#define __attribute__(x)
+#endif
+
 #if defined(__APPLE__)
 #if __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ >= 1070
 #define __APPLE_USE_RFC_3542  1
@@ -354,8 +359,13 @@
 #endif /* TARGET_DARWIN */
 
 #ifdef WIN32
-#include <iphlpapi.h>
+ // Missing declarations for MinGW 32.
+ // #if !defined(__MINGW64_VERSION_MAJOR) || __MINGW64_VERSION_MAJOR < 2
+ typedef int MIB_TCP_STATE;
+ // #endif
+#include <naptypes.h>
 #include <ntddndis.h>
+#include <iphlpapi.h>
 #include <wininet.h>
 #include <shellapi.h>
 /* The following two headers are needed of PF_INET6 */
@@ -554,10 +564,10 @@ socket_defined (const socket_descriptor_t sd)
 #define MANAGMENT_EXTERNAL_KEY
 #endif
 
-/* Enable PolarSSL RNG prediction resistance support */
-#ifdef ENABLE_CRYPTO_POLARSSL
+/* Enable mbed TLS RNG prediction resistance support */
+#ifdef ENABLE_CRYPTO_MBEDTLS
 #define ENABLE_PREDICTION_RESISTANCE
-#endif /* ENABLE_CRYPTO_POLARSSL */
+#endif /* ENABLE_CRYPTO_MBEDTLS */
 
 /*
  * MANAGEMENT_IN_EXTRA allows the management interface to
@@ -619,13 +629,6 @@ socket_defined (const socket_descriptor_t sd)
  */
 #if defined(WIN32) && defined(ENABLE_CRYPTO) && defined(ENABLE_CRYPTO_OPENSSL)
 #define ENABLE_CRYPTOAPI
-#endif
-
-/*
- * Enable x509-track feature?
- */
-#if defined(ENABLE_CRYPTO) && defined (ENABLE_CRYPTO_OPENSSL)
-#define ENABLE_X509_TRACK
 #endif
 
 /*
@@ -698,14 +701,9 @@ socket_defined (const socket_descriptor_t sd)
 #endif
 
 /*
- * Do we support internal client-side NAT?
- */
-#define ENABLE_CLIENT_NAT
-
-/*
  * Compression support
  */
-#if defined(ENABLE_SNAPPY) || defined(ENABLE_LZO) || defined(ENABLE_LZ4) || \
+#if defined(ENABLE_LZO) || defined(ENABLE_LZ4) || \
     defined(ENABLE_COMP_STUB)
 #define USE_COMP
 #endif
