@@ -713,7 +713,6 @@ openvpn_decrypt (struct buffer *buf, struct buffer work,
 void
 crypto_adjust_frame_parameters(struct frame *frame,
 			       const struct key_type* kt,
-			       bool cipher_defined,
 			       bool use_iv,
 			       bool packet_id,
 			       bool packet_id_long_form)
@@ -723,7 +722,7 @@ crypto_adjust_frame_parameters(struct frame *frame,
   if (packet_id)
     crypto_overhead += packet_id_size (packet_id_long_form);
 
-  if (cipher_defined)
+  if (kt->cipher)
     {
       if (use_iv)
 	crypto_overhead += cipher_kt_iv_size (kt->cipher);
@@ -739,8 +738,8 @@ crypto_adjust_frame_parameters(struct frame *frame,
 
   frame_add_to_extra_frame (frame, crypto_overhead);
 
-  msg(D_MTU_DEBUG, "%s: Adjusting frame parameters for crypto by %zu bytes",
-      __func__, crypto_overhead);
+  msg(D_MTU_DEBUG, "%s: Adjusting frame parameters for crypto by %u bytes",
+      __func__, (unsigned int) crypto_overhead);
 }
 
 size_t
@@ -756,14 +755,12 @@ crypto_max_overhead(void)
  */
 void
 init_key_type (struct key_type *kt, const char *ciphername,
-	       bool ciphername_defined, const char *authname,
-	       bool authname_defined, int keysize,
-	       bool tls_mode, bool warn)
+	       const char *authname, int keysize, bool tls_mode, bool warn)
 {
   bool aead_cipher = false;
 
   CLEAR (*kt);
-  if (ciphername && ciphername_defined)
+  if (ciphername)
     {
       kt->cipher = cipher_kt_get (translate_cipher_name_from_openvpn(ciphername));
       kt->cipher_length = cipher_kt_key_size (kt->cipher);
@@ -788,7 +785,7 @@ init_key_type (struct key_type *kt, const char *ciphername,
       if (warn)
 	msg (M_WARN, "******* WARNING *******: null cipher specified, no encryption will be used");
     }
-  if (authname && authname_defined)
+  if (authname)
     {
       if (!aead_cipher) { /* Ignore auth for AEAD ciphers */
 	kt->digest = md_kt_get (authname);
@@ -828,9 +825,14 @@ init_key_ctx (struct key_ctx *ctx, struct key *key,
       dmsg (D_SHOW_KEYS, "%s: CIPHER KEY: %s", prefix,
           format_hex (key->cipher, kt->cipher_length, 0, &gc));
       dmsg (D_CRYPTO_DEBUG, "%s: CIPHER block_size=%d iv_size=%d",
-          prefix,
-          cipher_kt_block_size(kt->cipher),
-          cipher_kt_iv_size(kt->cipher));
+          prefix, cipher_kt_block_size(kt->cipher),
+	  cipher_kt_iv_size(kt->cipher));
+      if (cipher_kt_block_size(kt->cipher) < 128/8)
+	{
+	  msg (M_WARN, "WARNING: this cipher's block size is less than 128 bit "
+	      "(%d bit).  Consider using a --cipher with a larger block size.",
+	      cipher_kt_block_size(kt->cipher)*8);
+	}
     }
   if (kt->digest && kt->hmac_length > 0)
     {

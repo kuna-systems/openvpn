@@ -245,13 +245,30 @@ incoming_push_message (struct context *c, const struct buffer *buffer)
 	  if (!do_up (c, true, c->options.push_option_types_found))
 	    {
 	      msg (D_PUSH_ERRORS, "Failed to open tun/tap interface");
-	      register_signal (c, SIGUSR1, "do_up-failed");
-	      goto cleanup;
+	      goto error;
 	    }
 	}
       event_timeout_clear (&c->c2.push_request_interval);
     }
+  else if (status == PUSH_MSG_REQUEST)
+    {
+      if (c->options.mode == MODE_SERVER)
+	{
+	  struct tls_session *session = &c->c2.tls_multi->session[TM_ACTIVE];
+	  /* Do not regenerate keys if client send a second push request */
+	  if (!session->key[KS_PRIMARY].crypto_options.key_ctx_bi.initialized &&
+	      !tls_session_update_crypto_params (session, &c->options,
+		  &c->c2.frame))
+	    {
+	      msg (D_TLS_ERRORS, "TLS Error: server generate_key_expansion failed");
+	      goto error;
+	    }
+	}
+    }
 
+  goto cleanup;
+error:
+  register_signal (c, SIGUSR1, "process-push-msg-failed");
 cleanup:
   gc_free (&gc);
 }
@@ -302,13 +319,24 @@ prepare_push_reply (struct options *o, struct tls_multi *tls_multi)
     }
 
   /* Push cipher if client supports Negotiable Crypto Parameters */
-  optstr = peer_info ? strstr(peer_info, "IV_NCP=") : NULL;
-  if (optstr)
+  if (tls_peer_info_ncp_ver (peer_info) >= 2 && o->ncp_enabled)
     {
-      int ncp = 0;
-      int r = sscanf(optstr, "IV_NCP=%d", &ncp);
-      if ((r == 1) && (ncp == 2))
+      /* if we have already created our key, we cannot change our own
+       * cipher, so disable NCP and warn = explain why
+       */
+      struct tls_session *session = &tls_multi->session[TM_ACTIVE];
+      if ( session->key[KS_PRIMARY].crypto_options.key_ctx_bi.initialized )
 	{
+	   msg( M_INFO, "PUSH: client wants to negotiate cipher (NCP), but "
+			"server has already generated data channel keys, "
+			"ignoring client request" );
+	}
+      else
+	{
+	  /* Push the first cipher from --ncp-ciphers to the client.
+	   * TODO: actual negotiation, instead of server dictatorship. */
+	  char *push_cipher = string_alloc(o->ncp_ciphers, &o->gc);
+	  o->ciphername = strtok (push_cipher, ":");
 	  push_option_fmt(o, M_USAGE, "cipher %s", o->ciphername);
 	}
     }

@@ -830,7 +830,6 @@ init_options (struct options *o, const bool init_gc)
 #endif
 #ifdef ENABLE_CRYPTO
   o->ciphername = "BF-CBC";
-  o->ciphername_defined = true;
 #ifdef HAVE_AEAD_CIPHER_MODES /* IV_NCP=2 requires GCM support */
   o->ncp_enabled = true;
 #else
@@ -838,7 +837,6 @@ init_options (struct options *o, const bool init_gc)
 #endif
   o->ncp_ciphers = "AES-256-GCM:AES-128-GCM";
   o->authname = "SHA1";
-  o->authname_defined = true;
   o->prng_hash = "SHA1";
   o->prng_nonce_secret_len = 16;
   o->replay = true;
@@ -1618,9 +1616,7 @@ show_settings (const struct options *o)
 #ifdef ENABLE_CRYPTO
   SHOW_STR (shared_secret_file);
   SHOW_INT (key_direction);
-  SHOW_BOOL (ciphername_defined);
   SHOW_STR (ciphername);
-  SHOW_BOOL (authname_defined);
   SHOW_STR (authname);
   SHOW_STR (prng_hash);
   SHOW_INT (prng_nonce_secret_len);
@@ -2618,6 +2614,15 @@ options_postprocess_mutate (struct options *o)
       if (streq (o->dh_file, "none"))
 	o->dh_file = NULL;
     }
+
+  /* cipher negotiation (NCP) currently assumes --pull or --mode server */
+  if ( o->ncp_enabled &&
+        ! (o->pull || o->mode == MODE_SERVER) )
+    {
+      msg( M_WARN, "disabling NCP mode (--ncp-disable) because not "
+                   "in P2MP client or server mode" );
+      o->ncp_enabled = false;
+    }
 #endif
 
 #if ENABLE_MANAGEMENT
@@ -2989,15 +2994,14 @@ calc_options_string_link_mtu(const struct options *o, const struct frame *frame)
     {
       struct frame fake_frame = *frame;
       struct key_type fake_kt;
-      init_key_type (&fake_kt, o->ciphername, o->ciphername_defined,
-	  o->authname, o->authname_defined, o->keysize, true, false);
+      init_key_type (&fake_kt, o->ciphername, o->authname, o->keysize, true,
+	  false);
       frame_add_to_extra_frame (&fake_frame, -(crypto_max_overhead()));
-      crypto_adjust_frame_parameters (&fake_frame, &fake_kt,
-	  o->ciphername_defined, o->use_iv, o->replay,
-	  cipher_kt_mode_ofb_cfb (fake_kt.cipher));
+      crypto_adjust_frame_parameters (&fake_frame, &fake_kt, o->use_iv,
+	  o->replay, cipher_kt_mode_ofb_cfb (fake_kt.cipher));
       frame_finalize(&fake_frame, o->ce.link_mtu_defined, o->ce.link_mtu,
             o->ce.tun_mtu_defined, o->ce.tun_mtu);
-      msg (D_MTU_DEBUG, "%s: link-mtu %zu -> %d", __func__, link_mtu,
+      msg (D_MTU_DEBUG, "%s: link-mtu %u -> %d", __func__, (unsigned int) link_mtu,
 	  EXPANDED_SIZE (&fake_frame));
       link_mtu = EXPANDED_SIZE (&fake_frame);
     }
@@ -3066,7 +3070,7 @@ options_string (const struct options *o,
    */
 
   buf_printf (&out, ",dev-type %s", dev_type_string (o->dev, o->dev_type));
-  buf_printf (&out, ",link-mtu %zu", calc_options_string_link_mtu(o, frame));
+  buf_printf (&out, ",link-mtu %u", (unsigned int) calc_options_string_link_mtu(o, frame));
   buf_printf (&out, ",tun-mtu %d", PAYLOAD_SIZE (frame));
   buf_printf (&out, ",proto %s",  proto_remote (o->ce.proto, remote));
 
@@ -3146,9 +3150,8 @@ options_string (const struct options *o,
 		+ (TLS_SERVER == true)
 		<= 1);
 
-	init_key_type (&kt, o->ciphername, o->ciphername_defined,
-		       o->authname, o->authname_defined,
-		       o->keysize, true, false);
+	init_key_type (&kt, o->ciphername, o->authname, o->keysize, true,
+	    false);
 
 	buf_printf (&out, ",cipher %s",
 	    translate_cipher_name_to_openvpn(cipher_kt_name (kt.cipher)));
@@ -6646,43 +6649,29 @@ add_option (struct options *options,
   else if (streq (p[0], "auth") && p[1] && !p[2])
     {
       VERIFY_PERMISSION (OPT_P_GENERAL);
-      options->authname_defined = true;
       options->authname = p[1];
       if (streq (options->authname, "none"))
 	{
-	  options->authname_defined = false;
 	  options->authname = NULL;
 	}
-    }
-  else if (streq (p[0], "auth") && !p[1])
-    {
-      VERIFY_PERMISSION (OPT_P_GENERAL);
-      options->authname_defined = true;
     }
   else if (streq (p[0], "cipher") && p[1] && !p[2])
     {
       VERIFY_PERMISSION (OPT_P_NCP);
-      options->ciphername_defined = true;
       options->ciphername = p[1];
       if (streq (options->ciphername, "none"))
 	{
-	  options->ciphername_defined = false;
 	  options->ciphername = NULL;
 	}
     }
-  else if (streq (p[0], "cipher") && !p[1])
-    {
-      VERIFY_PERMISSION (OPT_P_GENERAL);
-      options->ciphername_defined = true;
-    }
   else if (streq (p[0], "ncp-ciphers") && p[1] && !p[2])
     {
-      VERIFY_PERMISSION (OPT_P_GENERAL);
+      VERIFY_PERMISSION (OPT_P_GENERAL|OPT_P_INSTANCE);
       options->ncp_ciphers = p[1];
     }
   else if (streq (p[0], "ncp-disable") && !p[1])
     {
-      VERIFY_PERMISSION (OPT_P_GENERAL);
+      VERIFY_PERMISSION (OPT_P_GENERAL|OPT_P_INSTANCE);
       options->ncp_enabled = false;
     }
   else if (streq (p[0], "prng") && p[1] && !p[3])
